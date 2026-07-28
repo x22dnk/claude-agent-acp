@@ -1004,7 +1004,7 @@ function isMuslLibc(): boolean {
 }
 
 function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
+  return false;
 }
 
 /** Returned to clients when a prompt or cancel targets a session whose SDK
