@@ -3,13 +3,6 @@ on:
   push:
     branches:
       - main
-  # Previews are gated on CI, so they hang off the CI workflow finishing rather than
-  # off the push itself. `branches` filters on the *validated* branch, which keeps
-  # every PR CI run from spawning a Publish and Release run with all jobs skipped.
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       channel:
@@ -74,6 +67,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -85,28 +80,28 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - run: npm ci
       - run: npm run build
-      - run: npm publish
+      - name: Publish
+        id: publish
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          npm publish
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   # Same shape as publish-npm. Tagging is a separate job, so nothing here needs
   # write access to the repository.
   publish-npm-preview:
     name: Publish preview to npm
     runs-on: ubuntu-latest
-    # Every CI-green push to main gets a preview, except release-please's own release
-    # merge: merging that PR already published this exact tree as a stable version, so
-    # a preview of it would be a double release. release-please's `releases_created`
-    # output would be the sharper signal, but it belongs to the push-triggered run and
-    # this job runs in the workflow_run one, so the commit is checked instead — by
-    # author and by the subject release-please generates, either of which is enough.
+    # Every push to main gets a preview without waiting for CI or release-please,
+    # except release-please's own release merge, which publishes a stable version.
+    # Check the commit author and the generated release subject to avoid publishing
+    # the same tree twice; either match is enough to skip the preview.
     if: >-
       ${{
         (github.event_name == 'workflow_dispatch' && inputs.channel == 'preview') ||
-        (github.event_name == 'workflow_run'
-          && github.event.workflow_run.conclusion == 'success'
-          && github.event.workflow_run.event == 'push'
-          && github.event.workflow_run.head_repository.full_name == github.repository
-          && github.event.workflow_run.head_commit.author.name != 'acp-release-bot[bot]'
-          && !startsWith(github.event.workflow_run.head_commit.message, 'chore(main): release '))
+        (github.event_name == 'push'
+          && github.event.head_commit.author.name != 'acp-release-bot[bot]'
+          && !startsWith(github.event.head_commit.message, 'chore(main): release '))
       }}
     # Same environment as the stable job, so the npm trusted-publisher binding holds.
     # It carries no required reviewers, so previews never wait for an approval.
@@ -128,9 +123,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          # workflow_run runs default to the tip of the default branch, so the commit
-          # CI actually validated has to be asked for explicitly.
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+          # Publish the exact pushed commit, or the explicitly requested manual ref.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
           # Brings the tags the version calculation reads as its floor. The repo is a
           # few megabytes packed, so a full fetch is cheap and sidesteps every
           # shallow-clone tag caveat.
@@ -156,18 +150,13 @@ jobs:
         # --no-git-tag-version skips every git operation.
         run: npm version "${{ steps.preview.outputs.version }}" --no-git-tag-version
       - run: npm run build
-      # TODO(preview-releases): once one run has proved the trigger, the gate and the
-      # version calculation on main, drop --dry-run and add
-      # `echo "published=true" >> "$GITHUB_OUTPUT"` to this step. Nothing else needs
-      # touching — leaving `published` unset is what keeps the tag and the registry
-      # dispatch dormant while the publish is only a rehearsal. The workflow_run
-      # trigger and the `release` environment's protected-branch policy mean this job
-      # cannot be exercised from a feature branch at all.
       - name: Publish
         id: publish
         # --tag is mandatory: npm publish defaults to `latest` even for a semver
         # prerelease, which would point every plain `npm install` at a preview.
-        run: npm publish --dry-run --tag preview
+        run: |
+          npm publish --tag preview
+          echo "published=true" >> "$GITHUB_OUTPUT"
     outputs:
       published: ${{ steps.publish.outputs.published }}
       version: ${{ steps.preview.outputs.version }}
@@ -225,7 +214,45 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions: {}
+    # npm metadata is normally visible within about five minutes. Leave 2.5x that
+    # window for propagation, plus enough time to mint the token and dispatch.
+    timeout-minutes: 15
     steps:
+      - name: Wait for package to become available
+        if: ${{ needs.publish-npm.result == 'success' || needs.publish-npm-preview.outputs.published == 'true' }}
+        env:
+          PACKAGE: "@agentclientprotocol/claude-agent-acp"
+          VERSION: ${{ needs.publish-npm-preview.outputs.version || needs.publish-npm.outputs.version }}
+        #language=bash
+        run: |
+          if [ -z "$VERSION" ]; then
+            echo "::error::The publish job did not report a package version."
+            exit 1
+          fi
+
+          deadline=$((SECONDS + 750))
+          while (( SECONDS < deadline )); do
+            if timeout 10s npm pack "$PACKAGE@$VERSION" \
+              --dry-run \
+              --ignore-scripts \
+              --silent \
+              --registry=https://registry.npmjs.org \
+              --prefer-online \
+              --fetch-retries=0 >/dev/null 2>&1; then
+              echo "$PACKAGE@$VERSION is available from npm."
+              exit 0
+            fi
+
+            remaining=$((deadline - SECONDS))
+            if (( remaining > 0 )); then
+              echo "Waiting for $PACKAGE@$VERSION to become available (${remaining}s remaining)..."
+              sleep 10
+            fi
+          done
+
+          echo "::error::$PACKAGE@$VERSION was not available from npm after 12.5 minutes."
+          exit 1
+
       - name: Generate token scoped to the registry repo
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         id: registry-token
